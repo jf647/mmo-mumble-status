@@ -1,0 +1,10 @@
+description     "SOTS Mumble Server Status Checker"
+
+start on started network-interface
+stop on stopped network-interface
+
+respawn
+
+script
+        exec /home/avahi-daemon ${opts}
+end script

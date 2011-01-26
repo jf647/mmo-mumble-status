@@ -1,0 +1,289 @@
+#!/usr/bin/perl
+#
+# $Id$
+#
+
+use common::sense;
+
+use Data::Compare;
+use FindBin;
+use Getopt::Long;
+use HTTP::Request::Common qw|GET POST|;
+use JSON::DWIW;
+use Log::Log4perl;
+use POE qw|Component::Client::HTTP|;
+use YAML;
+
+# parse command line
+my %o;
+GetOptions(
+  \%o,
+  'debug!',
+  'trace!',
+);
+
+# load config
+my $cfg = YAML::LoadFile("$FindBin::Bin/../etc/mumblestatus.yaml");
+
+# init logging
+my $logcfg = $cfg->{logging};
+if( $o{trace} ) {
+  $logcfg->{'log4perl.logger'} = 'TRACE, FILE';
+}
+elsif( $o{debug} ) {
+  $logcfg->{'log4perl.logger'} = 'DEBUG, FILE';
+}
+else {
+  $logcfg->{'log4perl.logger'} = 'INFO, FILE';
+}
+Log::Log4perl->init( $logcfg );
+my $log = Log::Log4perl->get_logger('');
+$log->info('START');
+
+# create our HTTP client
+POE::Component::Client::HTTP->spawn(
+  Alias => 'ua',
+  Timeout => $cfg->{server_timeout},
+);
+
+# create checking session
+POE::Session->create(
+  inline_states => {
+    _start => \&start_checker,
+    check => \&check,
+    parse_status => \&parse_status,
+    compare_status => \&compare_status,
+    build_channels => \&build_channels,
+    build_usermap => \&build_usermap,
+    report_changes => \&report_changes,
+    handle_sigterm => sub {
+      $log->info("SIGTERM received, shutting down");
+      $_[HEAP]->{done} = 1;
+    },
+    handle_sighup => sub {
+      $log->info("SIGHUP received, scheduling rebuild of channel map");
+      $_[HEAP]->{build_channels} = 1;
+      $_[KERNEL]->sig_handled();
+    },
+  },
+);
+
+# run our event loop
+POE::Kernel->run;
+
+# All done
+$log->info('STOP');
+
+exit(0);
+
+# event handlers
+sub start_checker
+{
+
+  my($kernel, $heap) = @_[KERNEL,HEAP];
+  
+  $kernel->alias_set('checker');
+  $heap->{done} = 0;
+  $heap->{build_channels} = 1;
+  $heap->{usermap} = {};
+  $kernel->sig( TERM => 'handle_sigterm' );
+  $kernel->sig( HUP => 'handle_sighup' );
+  
+  # build the URL we'll be checking
+  my $url = $cfg->{server_status_url};
+  $url =~ s/\$ID/$cfg->{server}->{id}/;
+  $url =~ s/\$TOKEN/$cfg->{server}->{token}/;
+  $url =~ s/\$SECRET/$cfg->{server}->{secret}/;
+  $heap->{url} = $url;
+  
+  # create a JSON decoder
+  $heap->{json} = JSON::DWIW->new;
+  
+  # schedule our first check immediately
+  $kernel->delay( check => 0 );
+
+}
+
+# queue up a check of the server status
+sub check
+{
+
+  my($kernel, $heap) = @_[KERNEL,HEAP];
+  
+  # reschedule ourselves unless we've been told to stop
+  unless( $heap->{done} ) {
+    $kernel->delay( check => $cfg->{interval} );
+  }
+  
+  # ask the HTTP client to pull the JSON status of the server
+  $kernel->post( ua => request => parse_status => GET $heap->{url} );
+
+}
+
+# parse a server response
+sub parse_status
+{
+
+  my($kernel, $heap, $req, $res) = @_[KERNEL,HEAP,ARG0,ARG1];
+
+  # did we get a succesful response?
+  unless( $res->[0]->is_success ) {
+    $log->error("request failed with response code: ", $res->[0]->code);
+    return;
+  }
+
+  # get the string of the response
+  my $response = $res->[0]->decoded_content;
+
+  # decode the JSON
+  my $status = $heap->{json}->from_json( $response );
+  unless( $status ) {
+    $log->error("couldn't parse JSON response: ", $heap->{json}->get_error_string);
+    $log->error($response);
+    return;
+  }
+  
+  # if we don't have a channel list, the server may be down
+  unless( exists $status->{channels} ) {
+    $log->error("no channels in JSON response, server possibly down");
+    $log->error($response);
+    return;
+  }
+
+  # store the current status for other handlers to use
+  $heap->{status} = $status;
+
+  # if we need to build the channel map, do so
+  if( $heap->{build_channels} ) {
+    $kernel->call( $_[SESSION] => 'build_channels' );
+  }
+  
+  # if the number of channels has changed, rebuild the channel map
+  if( scalar keys %{ $heap->{channels}->{id_to_name} } != scalar @{ $status->{channels} } ) {
+    $log->info("channel count has changed, rebuilding channel map");
+    $kernel->call( $_[SESSION] => 'build_channels' );
+  }
+  
+  # compare the current status to the last one
+  $kernel->yield( 'compare_status' );
+
+}
+
+# compare the server response to the one before it
+sub compare_status
+{
+
+  my($kernel, $heap) = @_[KERNEL,HEAP,ARG0];
+  
+  my $users = $heap->{status}->{users};
+
+  # build a user map of our new status
+  my $usermap = $kernel->call( $_[SESSION], build_usermap => $users );
+
+  if( Compare($heap->{usermap}, $usermap) ) {
+    $log->debug("no change from last status");
+    $heap->{usermap} = $usermap;
+  }
+  else {
+    $log->debug("status has changed");
+    $kernel->yield( report_changes => $heap->{usermap}, $usermap );
+  }
+
+}
+
+# report changes in users
+sub report_changes
+{
+
+  my($kernel, $heap, $oldmap, $newmap) = @_[KERNEL,HEAP,ARG0,ARG1];
+
+  # changed related to current users
+  for my $user( keys %$newmap ) {
+
+    # user logged on
+    unless( exists $oldmap->{$user} ) {
+      $log->info("$user logged on and joined channel $newmap->{$user}->[1] at $heap->{online}->{$user}");
+      next;
+    }
+    
+    # user channel changed
+    if( $newmap->{$user}->[0] != $oldmap->{$user}->[0] ) {
+      $log->info("$user moved from $oldmap->{$user}->[1] to $newmap->{$user}->[1]");
+    }
+
+  }
+  
+  # check for log offs
+  for my $user( keys %$oldmap ) {
+    unless( exists $newmap->{$user} ) {
+      $log->info("$user logged off, was in channel $oldmap->{$user}->[1], online since $heap->{online}->{$user}");
+      delete $heap->{online}->{$user};
+    }
+  }
+  
+  $heap->{usermap} = $newmap;
+  
+}
+
+# build a map of channels on the server
+sub build_channels
+{
+
+  my $heap  = $_[HEAP];
+
+  my $channels = $heap->{status}->{channels};
+
+  $log->info("building channel map");
+  
+  my %id_to_name;
+  my %name_to_id;
+  for my $channel( @$channels ) {
+    $log->debug("found $channel->{state} channel $channel->{name} ($channel->{id})");
+    if( 'temporary' eq $channel->{state} ) {
+      $id_to_name{$channel->{id}} = $channel->{name} . '*';
+    }
+    else {
+      $id_to_name{$channel->{id}} = $channel->{name};
+    }
+    $name_to_id{$channel->{name}} = $channel->{id};
+  }
+  
+  $heap->{channels} = {
+    id_to_name => \%id_to_name,
+    name_to_id => \%name_to_id,
+  };
+  
+  $heap->{build_channels} = 0;
+
+}
+
+# build a map of user state
+sub build_usermap
+{
+
+  my($kernel, $heap) = @_[KERNEL,HEAP];
+
+  my $users = $heap->{status}->{users};
+  my $now = time();
+
+  $log->debug("we have ", scalar @$users, " users online");
+
+  my %usermap;
+  for my $user( @$users ) {
+    unless( exists $heap->{online}->{$user->{name}} ) {
+      $heap->{online}->{$user->{name}} = scalar localtime($now - $user->{online});
+    }
+    unless( exists $heap->{channels}->{id_to_name}->{$user->{channel}} ){
+      $log->info("unknown channel id $user->{channel}, rebuilding channel map");
+      $kernel->call( $_[SESSION] => 'build_channels' );
+    }
+    $usermap{$user->{name}} = [ $user->{channel}, $heap->{channels}->{id_to_name}->{$user->{channel}} ];
+    $log->debug("found $user->{state} user $user->{name} online since $heap->{online}->{$user->{name}} in channel ", $heap->{channels}->{id_to_name}->{$user->{channel}});
+  }
+  
+  return \%usermap;
+
+}
+
+#
+# EOF

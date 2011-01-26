@@ -1,0 +1,8 @@
+/var/log/mumblestatus.log {
+	daily
+	rotate 14
+	compress
+	delaycompress
+	missingok
+    create 0755 james wheel
+}
