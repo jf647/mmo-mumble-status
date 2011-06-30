@@ -1,0 +1,2 @@
+:programname,contains,"mumblestatus" /var/log/mumblestatus.log
+
