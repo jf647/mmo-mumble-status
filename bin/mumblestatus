@@ -28,13 +28,13 @@ my $cfg = YAML::LoadFile("$FindBin::Bin/../etc/mumblestatus.yaml");
 # init logging
 my $logcfg = $cfg->{logging};
 if( $o{trace} ) {
-  $logcfg->{'log4perl.logger'} = 'TRACE, FILE';
+  $logcfg->{'log4perl.logger'} = 'TRACE, SYSLOG';
 }
 elsif( $o{debug} ) {
-  $logcfg->{'log4perl.logger'} = 'DEBUG, FILE';
+  $logcfg->{'log4perl.logger'} = 'DEBUG, SYSLOG';
 }
 else {
-  $logcfg->{'log4perl.logger'} = 'INFO, FILE';
+  $logcfg->{'log4perl.logger'} = 'INFO, SYSLOG';
 }
 Log::Log4perl->init( $logcfg );
 my $log = Log::Log4perl->get_logger('');
@@ -50,12 +50,15 @@ POE::Component::Client::HTTP->spawn(
 POE::Session->create(
   inline_states => {
     _start => \&start_checker,
-    check => \&check,
+    check_channels_users => \&check_channels_users,
+    check_status => \&check_status,
     parse_status => \&parse_status,
-    compare_status => \&compare_status,
+    parse_channels_users => \&parse_channels_users,
+    compare_users => \&compare_users,
     build_channels => \&build_channels,
     build_usermap => \&build_usermap,
-    report_changes => \&report_changes,
+    report_user_changes => \&report_user_changes,
+    report_status => \&report_status,
     handle_sigterm => sub {
       $log->info("SIGTERM received, shutting down");
       $_[HEAP]->{done} = 1;
@@ -89,38 +92,58 @@ sub start_checker
   $kernel->sig( TERM => 'handle_sigterm' );
   $kernel->sig( HUP => 'handle_sighup' );
   
-  # build the URL we'll be checking
-  my $url = $cfg->{server_status_url};
-  $url =~ s/\$ID/$cfg->{server}->{id}/;
-  $url =~ s/\$TOKEN/$cfg->{server}->{token}/;
-  $url =~ s/\$SECRET/$cfg->{server}->{secret}/;
-  $heap->{url} = $url;
+  # build the URLs we'll be checking
+  for my $urltype( qw|channels_users_url status_url| ) {
+    my $url = $cfg->{$urltype};
+    $url =~ s/\$ID/$cfg->{server}->{id}/;
+    $url =~ s/\$TOKEN/$cfg->{server}->{token}/;
+    $url =~ s/\$SECRET/$cfg->{server}->{secret}/;
+    $log->debug("$urltype url is $url");
+    $heap->{$urltype} = $url;
+  }
   
   # create a JSON decoder
   $heap->{json} = JSON::DWIW->new;
   
   # schedule our first check immediately
-  $kernel->delay( check => 0 );
+  #$kernel->delay( check_status => 0 );
+  $kernel->delay( check_channels_users => 1 );
 
 }
 
 # queue up a check of the server status
-sub check
+sub check_status
+{
+
+  my($kernel, $heap) = @_[KERNEL,HEAP];
+
+  # reschedule ourselves unless we've been told to stop
+  unless( $heap->{done} ) {
+    $kernel->delay( check_status => $cfg->{status_interval} );
+  }
+  
+  # ask the HTTP client to pull the JSON status of the server
+  $kernel->post( ua => request => parse_status => GET $heap->{status_url} );
+
+}
+
+# queue up a check of the channels and users
+sub check_channels_users
 {
 
   my($kernel, $heap) = @_[KERNEL,HEAP];
   
   # reschedule ourselves unless we've been told to stop
   unless( $heap->{done} ) {
-    $kernel->delay( check => $cfg->{interval} );
+    $kernel->delay( check_channels_users => $cfg->{channels_users_interval} );
   }
   
   # ask the HTTP client to pull the JSON status of the server
-  $kernel->post( ua => request => parse_status => GET $heap->{url} );
+  $kernel->post( ua => request => parse_channels_users => GET $heap->{channels_users_url} );
 
 }
 
-# parse a server response
+# parse a server status response
 sub parse_status
 {
 
@@ -128,7 +151,7 @@ sub parse_status
 
   # did we get a succesful response?
   unless( $res->[0]->is_success ) {
-    $log->error("request failed with response code: ", $res->[0]->code);
+    $log->error("status request failed with response code: ", $res->[0]->code);
     return;
   }
 
@@ -138,7 +161,35 @@ sub parse_status
   # decode the JSON
   my $status = $heap->{json}->from_json( $response );
   unless( $status ) {
-    $log->error("couldn't parse JSON response: ", $heap->{json}->get_error_string);
+    $log->error("couldn't parse status JSON response: ", $heap->{json}->get_error_string);
+    $log->error($response);
+    return;
+  }
+  
+  # report on the current status
+  $kernel->yield( 'report_status', $status );
+
+}
+
+# parse a channels and users response
+sub parse_channels_users
+{
+
+  my($kernel, $heap, $req, $res) = @_[KERNEL,HEAP,ARG0,ARG1];
+
+  # did we get a succesful response?
+  unless( $res->[0]->is_success ) {
+    $log->error("channels/users request failed with response code: ", $res->[0]->code);
+    return;
+  }
+
+  # get the string of the response
+  my $response = $res->[0]->decoded_content;
+
+  # decode the JSON
+  my $status = $heap->{json}->from_json( $response );
+  unless( $status ) {
+    $log->error("couldn't parse channels/users JSON response: ", $heap->{json}->get_error_string);
     $log->error($response);
     return;
   }
@@ -165,12 +216,12 @@ sub parse_status
   }
   
   # compare the current status to the last one
-  $kernel->yield( 'compare_status' );
+  $kernel->yield( 'compare_users' );
 
 }
 
 # compare the server response to the one before it
-sub compare_status
+sub compare_users
 {
 
   my($kernel, $heap) = @_[KERNEL,HEAP,ARG0];
@@ -186,13 +237,23 @@ sub compare_status
   }
   else {
     $log->debug("status has changed");
-    $kernel->yield( report_changes => $heap->{usermap}, $usermap );
+    $kernel->yield( report_user_changes => $heap->{usermap}, $usermap );
   }
 
 }
 
+# report the server status
+sub report_status
+{
+
+  my $status = $_[ARG0];
+  
+  $log->info("foo");
+
+}
+
 # report changes in users
-sub report_changes
+sub report_user_changes
 {
 
   my($kernel, $heap, $oldmap, $newmap) = @_[KERNEL,HEAP,ARG0,ARG1];
